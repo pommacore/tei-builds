@@ -1,0 +1,176 @@
+name: build-tei
+
+on:
+  workflow_dispatch:
+    inputs:
+      tei_version:
+        description: "TEI upstream tag (e.g. v1.9.3)"
+        required: true
+        default: "v1.9.3"
+
+# Least privilege by default; each job opts into exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: build-tei-${{ github.event.inputs.tei_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # mkl (Intel BLAS) is intentionally omitted on BOTH arches: it is
+          # x86-only (would break parity with arm64), bundles a large proprietary
+          # static blob at odds with a "generic CPU / portable" binary, and the
+          # default intel-mkl-src build (MKL 2020.1) is missing the hgemm_ symbol
+          # candle references -> static link failure. ort (ONNX Runtime) is the
+          # inference backend regardless. For peak x86 perf, add oneAPI MKL + MKLROOT.
+          - { arch: amd64, runner: ubuntu-24.04,     features: "ort,candle,static-linking,http" }
+          - { arch: arm64, runner: ubuntu-24.04-arm, features: "ort,candle,static-linking,http" }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      # User input is passed as data (never interpolated into a shell script)
+      # to avoid command injection.
+      TEI_VERSION: ${{ inputs.tei_version }}
+      TEI_FEATURES: ${{ matrix.features }}
+      ARCH: ${{ matrix.arch }}
+      RUST_TOOLCHAIN: "1.92"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Validate input
+        run: |
+          if [[ ! "$TEI_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid tei_version '$TEI_VERSION' (expected e.g. v1.9.3)"
+            exit 1
+          fi
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config protobuf-compiler \
+            libssl-dev libomp-dev curl ca-certificates python3
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      - name: Clone upstream TEI at the requested tag
+        run: |
+          git clone --depth 1 --branch "$TEI_VERSION" \
+            https://github.com/huggingface/text-embeddings-inference tei
+          {
+            echo "TEI_COMMIT=$(git -C tei rev-parse HEAD)"
+            echo "SOURCE_DATE_EPOCH=$(git -C tei log -1 --format=%ct)"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: tei
+          key: ${{ matrix.arch }}-${{ inputs.tei_version }}
+
+      - name: Build text-embeddings-router (upstream feature set, static ORT)
+        working-directory: tei
+        env:
+          # Normalise absolute build paths for a more deterministic binary.
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: |
+          cargo build --release --locked --no-default-features \
+            --bin text-embeddings-router --features "$TEI_FEATURES"
+
+      - name: Smoke test (binary runs)
+        run: ./tei/target/release/text-embeddings-router --help >/dev/null
+
+      - name: Assemble release bundle
+        run: |
+          OUT="tei-${TEI_VERSION}-linux-${ARCH}"
+          mkdir -p "dist/${OUT}"
+          cp tei/target/release/text-embeddings-router "dist/${OUT}/"
+
+          # Apache-2.0 §4(a): ship a copy of the upstream license with the binary.
+          if [ -f tei/LICENSE ]; then cp tei/LICENSE "dist/${OUT}/LICENSE"; else
+            echo "::warning::upstream LICENSE not found in clone"; fi
+          # Apache-2.0 §4(d): include upstream NOTICE if present.
+          [ -f tei/NOTICE ] && cp tei/NOTICE "dist/${OUT}/NOTICE"
+
+          # ONNX Runtime is statically linked via -F ort and is MIT-licensed;
+          # its notice must travel with the binary.
+          {
+            echo "THIRD-PARTY NOTICES for ${OUT}"
+            echo
+            echo "This binary statically links ONNX Runtime (MIT License), pulled in"
+            echo "via the Rust 'ort' crate by the '-F ort' feature."
+            echo "Full text: https://github.com/microsoft/onnxruntime/blob/main/LICENSE"
+            echo
+            echo "----- ONNX Runtime LICENSE -----"
+            curl -fsSL https://raw.githubusercontent.com/microsoft/onnxruntime/main/LICENSE \
+              || echo "(fetch failed; see URL above)"
+          } > "dist/${OUT}/THIRD-PARTY-NOTICES.txt"
+
+          {
+            echo "artifact:     ${OUT}"
+            echo "tei_tag:      ${TEI_VERSION}"
+            echo "tei_commit:   ${TEI_COMMIT}"
+            echo "features:     ${TEI_FEATURES} (--no-default-features)"
+            echo "rustc:        $(rustc --version)"
+            echo "target_cpu:   generic (portable baseline; not target-cpu=native)"
+            echo "source_epoch: ${SOURCE_DATE_EPOCH}"
+            echo "built_by:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "dist/${OUT}/BUILDINFO.txt"
+
+          tar -C dist -czf "dist/${OUT}.tar.gz" "${OUT}"
+          ( cd dist && sha256sum "${OUT}.tar.gz" | tee "${OUT}.tar.gz.sha256" )
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tei-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write     # create the release and upload assets
+      id-token: write     # OIDC token to sign the provenance attestation
+      attestations: write # persist the build provenance
+    env:
+      TEI_VERSION: ${{ inputs.tei_version }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create/refresh release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="tei-${TEI_VERSION}"
+          NOTES="Unmodified upstream text-embeddings-inference ${TEI_VERSION}, built with --features ort,candle,static-linking,http --no-default-features, generic CPU, Linux amd64/arm64. Each archive bundles the binary, upstream LICENSE, third-party notices, and BUILDINFO, plus a SHA-256 checksum. Verify provenance with: gh attestation verify <archive> -R ${GITHUB_REPOSITORY}"
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              -t "TEI ${TEI_VERSION} (stock, ort, static)" \
+              -n "$NOTES"
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber -R "$GITHUB_REPOSITORY"

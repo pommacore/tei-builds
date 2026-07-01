@@ -1,0 +1,13 @@
+{
+  // Recommended extensions for working on this repo. It is entirely GitHub
+  // Actions workflows, so the tooling is: author/validate workflows + edit YAML.
+  "recommendations": [
+    // GitHub Actions — syntax, workflow schema validation, expression help, and
+    // run monitoring for .github/workflows/*.yml. Publisher: GitHub (official).
+    "github.vscode-github-actions",
+
+    // YAML — lint + JSON-Schema validation for the workflow and dependabot files.
+    // Canonical YAML tooling. Publisher: Red Hat.
+    "redhat.vscode-yaml"
+  ]
+}
